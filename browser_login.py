@@ -26,7 +26,7 @@
 """
 import time
 
-from turnstile_solver import (_launch_chrome, _wait_cf_pass, _get_system_proxy,
+from turnstile_solver import (_launch_chrome, _get_system_proxy,
                               _solve_in_page, RENDER_JS)
 
 # 页面内提交登录：与求解 Turnstile 处于同一浏览器上下文，
@@ -62,6 +62,28 @@ def fetch_sitekey(base_url, verbose=True):
         if verbose:
             print(f'  [浏览器登录] 读取 sitekey 失败: {e}')
         return None
+
+
+def _wait_cf(page, timeout=60, verbose=True):
+    """
+    等待**当前页面**通过 Cloudflare 验证（不导航）。
+
+    不用 turnstile_solver._wait_cf_pass 的原因：它内部会 `page.goto(base_url)`，
+    会把已经进入的登录页重新拉回根路径，且对加载缓慢的站点（如 cpolar 隧道）
+    容易在 domcontentloaded 上超时。
+    """
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            title = page.title()
+        except Exception:
+            title = ''
+        if 'Attention Required' not in title and 'Just a moment' not in title:
+            return True
+        if verbose:
+            print(f'  [浏览器登录] 等待 CF 验证通过: {title[:40]}')
+        time.sleep(4)
+    return False
 
 
 def browser_login(base_url: str, username: str, password: str, sitekey: str = None,
@@ -101,18 +123,31 @@ def browser_login(base_url: str, username: str, password: str, sitekey: str = No
             ctx = browser.contexts[0]
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
-            if not _wait_cf_pass(page, base_url, verbose=verbose):
+            # 用 commit 而非 domcontentloaded：后者会被慢站点（cpolar 隧道等）
+            # 上阻塞加载的静态资源拖到超时。
+            try:
+                page.goto(login_url, wait_until='commit', timeout=60000)
+            except Exception as e:
+                print(f'  [浏览器登录] 导航到登录页超时，尝试继续: {str(e)[:70]}')
+
+            if not _wait_cf(page, timeout=60, verbose=verbose):
                 print('  [浏览器登录] Cloudflare 验证未通过')
                 browser.close()
                 return None
 
-            # _wait_cf_pass 会导航到站点根路径，这里再进入登录页
+            # 等 SPA 把登录表单渲染出来（慢站点给足时间）
             try:
-                page.goto(login_url, wait_until='domcontentloaded', timeout=45000)
+                page.wait_for_selector('input[type="password"]', timeout=45000)
             except Exception:
-                pass
-            # 等 SPA 把 api.js 初始化好（RENDER_JS 内部也会等，这里只是提前判断）
-            time.sleep(3)
+                print('  [浏览器登录] 未找到登录表单（页面结构可能不同或加载过慢）')
+                if verbose:
+                    try:
+                        print('    当前 URL:', page.url)
+                    except Exception:
+                        pass
+                browser.close()
+                return None
+            time.sleep(2)
 
             # 在站点页面内注入 Turnstile 组件并求解（origin 正确才能过域名校验）
             try:
