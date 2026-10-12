@@ -209,6 +209,47 @@ class NewAPICheckin:
               f'{"，并捕获到轮换后的新 token" if self.new_refresh_token else ""}')
         return True
 
+    def _login_via_browser(self) -> bool:
+        """
+        站点开启 Turnstile 时的登录回退：用真实 Chrome 在站点登录页完成登录。
+
+        为什么不能本地解 Turnstile：sitekey 绑定了站点域名，在 127.0.0.1 页面
+        渲染会报 error 110200 (invalid domain) 并导航到 invaliddomain。
+        详见 browser_login.py 的说明。
+
+        成功后把取到的凭据写回 self，并换取 access token。
+        """
+        try:
+            from browser_login import browser_login
+        except ImportError as e:
+            print(f'  [登录] 浏览器登录模块不可用（缺少 playwright/Chrome）: {e}')
+            return False
+
+        print('  [登录] 站点要求 Turnstile，改用真实浏览器登录（约需 30-90s）')
+        cookies = browser_login(self.base_url, self.login_username, self.login_password)
+        if not cookies:
+            return False
+
+        # 站点类型 B：拿到轮换型 refresh token
+        rt = cookies.get('new_api_refresh')
+        if rt:
+            self.refresh_token = rt
+            self.new_refresh_token = rt          # 供 main() 持久化到 Gist
+            self.session.cookies.set('new_api_refresh', rt, path='/api/user/auth')
+            print('  [登录] 已通过浏览器取得 refresh token')
+            return self._refresh_access_token()
+
+        # 站点类型 A：标准 session cookie
+        sess = cookies.get('session') or cookies.get('session_id')
+        if sess:
+            self.session_cookie = sess
+            self.session.cookies.set(self.session_name, sess)
+            print('  [登录] 已通过浏览器取得 session cookie')
+            return True
+
+        print('  [登录] 浏览器登录返回的 cookie 里没有可用凭据')
+        return False
+
     def _try_login(self) -> bool:
         """
         尝试使用配置的账号密码重新登录，获取新的 session
@@ -240,6 +281,15 @@ class NewAPICheckin:
             except json.JSONDecodeError:
                 content_preview = resp.text[:100] if resp.text else '(空响应)'
                 print(f'  [登录] 响应格式错误 (HTTP {resp.status_code}): {content_preview}')
+                return False
+
+            # ---- 站点开启 Turnstile：改用真实浏览器在登录页完成登录 ----
+            # 服务端把 token 读作**查询参数**，且 sitekey 绑定域名，只能在站点页面内解。
+            if (resp.status_code == 200 and not data.get('success')
+                    and 'turnstile' in str(data.get('message') or '').lower()):
+                if self._login_via_browser():
+                    return True
+                print('  [登录] 浏览器登录未成功')
                 return False
 
             if resp.status_code == 200 and data.get('success'):
