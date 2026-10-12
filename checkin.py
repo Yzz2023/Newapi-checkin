@@ -71,17 +71,22 @@ class NewAPICheckin:
         return '****'
 
     def __init__(self, base_url: str, session_cookie: str, user_id: str = None, cf_clearance: str = None,
-                 login_username: str = None, login_password: str = None, access_token: str = None):
+                 login_username: str = None, login_password: str = None, access_token: str = None,
+                 session_name: str = 'session', refresh_token: str = None):
         self.base_url = base_url.rstrip('/')
         self.session_cookie = session_cookie
+        self.session_name = session_name or 'session'
         self.original_cf_clearance = cf_clearance
         self.cf_bypassed = False
         self.login_username = login_username
         self.login_password = login_password
         self.access_token = access_token
+        # 轮换型 refresh token（站点类型 B）：使用时会被服务端轮换
+        self.refresh_token = refresh_token
+        self.new_refresh_token = None
         self.session = requests.Session()
         if session_cookie:
-            self.session.cookies.set('session', session_cookie)
+            self.session.cookies.set(self.session_name, session_cookie)
 
         if cf_clearance:
             self.session.cookies.set('cf_clearance', cf_clearance)
@@ -94,13 +99,85 @@ class NewAPICheckin:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         })
 
+        # 站点类型 B：先用 refresh token 换 access token（会轮换 refresh token）
+        if self.refresh_token:
+            self._refresh_access_token()
+
         # new-api 支持系统访问令牌认证（Authorization 头），不依赖 session cookie
-        if access_token:
-            self.session.headers.update({'Authorization': access_token})
+        if self.access_token:
+            self.session.headers.update({'Authorization': self.access_token})
 
         self.user_id = user_id
         if user_id:
             self.session.headers.update({'new-api-user': str(user_id)})
+
+    def _refresh_access_token(self) -> bool:
+        """
+        站点类型 B 的认证流程：
+            POST {base}/api/user/auth/refresh   （只需 new_api_refresh cookie）
+            -> {"data": {"access_token": <JWT>, "token_type": "Bearer", "session": {...}}}
+            -> 后续请求用 Authorization: Bearer <access_token>
+
+        注意：new_api_refresh 是一次性轮换令牌，服务端会在响应里用 Set-Cookie
+        下发新的值，必须保存下来供下次使用。
+        """
+        url = f'{self.base_url}/api/user/auth/refresh'
+        headers = {
+            'Origin': self.base_url,
+            'Referer': f'{self.base_url}/console/personal',
+            'Content-Type': 'application/json',
+        }
+        try:
+            resp = self.session.post(
+                url,
+                json={},
+                headers=headers,
+                cookies={'new_api_refresh': self.refresh_token},
+                timeout=30,
+            )
+        except Exception as e:
+            print(f'  [refresh] 请求异常: {e}')
+            return False
+
+        # 捕获轮换后的新 refresh token
+        for c in resp.cookies:
+            if c.name == 'new_api_refresh' and c.value:
+                self.new_refresh_token = c.value
+        raw_sc = resp.headers.get('Set-Cookie', '') or ''
+        if not self.new_refresh_token and 'new_api_refresh=' in raw_sc:
+            for seg in raw_sc.split(','):
+                seg = seg.strip()
+                if seg.startswith('new_api_refresh='):
+                    v = seg.split(';')[0].split('=', 1)[1].strip()
+                    if v:
+                        self.new_refresh_token = v
+
+        if resp.status_code != 200:
+            body = resp.text[:200].replace('\n', ' ')
+            print(f'  [refresh] 失败 HTTP {resp.status_code}: {body}')
+            return False
+
+        try:
+            data = resp.json().get('data') or {}
+            token = data.get('access_token')
+            token_type = data.get('token_type') or 'Bearer'
+            sess = data.get('session') or {}
+        except Exception as e:
+            print(f'  [refresh] 响应解析失败: {e}')
+            return False
+
+        if not token:
+            print('  [refresh] 响应里没有 access_token')
+            return False
+
+        self.access_token = f'{token_type} {token}'
+        self.session.headers.update({'Authorization': self.access_token})
+        if not self.user_id and sess.get('user_id'):
+            self.user_id = sess.get('user_id')
+            self.session.headers.update({'new-api-user': str(self.user_id)})
+        print(f'  [refresh] 已换取 access token（sid={str(sess.get("sid"))[:8]}...）'
+              f'{"，并捕获到轮换后的新 token" if self.new_refresh_token else ""}')
+        return True
 
     def _try_login(self) -> bool:
         """
@@ -573,12 +650,20 @@ def parse_accounts(accounts_str: str) -> list:
         data = json.loads(accounts_str)
         if isinstance(data, list):
             for item in data:
-                if isinstance(item, dict) and 'url' in item and 'session' in item:
+                if isinstance(item, dict) and 'url' in item and ('session' in item or 'refresh_token' in item):
                     account = {
                         'url': item['url'],
-                        'session': item['session'],
+                        'session': item.get('session', '') or '',
                         'name': item.get('name', '')
                     }
+                    # 会话 cookie 名（默认 session；部分站点用 new_api_refresh 等）
+                    if item.get('session_name'):
+                        account['session_name'] = item['session_name']
+                    # 轮换型 refresh token（站点类型 B）
+                    if item.get('refresh_token'):
+                        account['refresh_token'] = item['refresh_token']
+                    if item.get('auth_type'):
+                        account['auth_type'] = item['auth_type']
                     # 如果提供了 user_id，添加到账号信息中
                     if 'user_id' in item:
                         account['user_id'] = item['user_id']
@@ -801,21 +886,31 @@ def main():
         print('[错误] 账号配置解析失败')
         sys.exit(1)
 
+    # 应用 Gist 里保存的轮换凭据（站点类型 B 的 refresh token 每次使用都会变）
+    try:
+        import state_store
+        state_store.apply_to_accounts(accounts)
+    except Exception as e:
+        print(f'[state] 状态模块不可用: {e}')
+
     print(f'共 {len(accounts)} 个账号待签到\n')
 
     success_count = 0
     fail_count = 0
     checkin_results = []
     session_updated = False
+    rotated_refresh_tokens = {}
 
     for i, account in enumerate(accounts, 1):
         url = account['url']
-        session_cookie = account['session']
+        session_cookie = account.get('session') or ''
         user_id = account.get('user_id')
         cf_clearance = account.get('cf_clearance')
         login_username = account.get('login_username')
         login_password = account.get('login_password')
         access_token = account.get('access_token')
+        session_name = account.get('session_name') or 'session'
+        refresh_token = account.get('refresh_token')
         name = account.get('name') or f'账号{i}'
 
         print(f'[{i}/{len(accounts)}] {name}')
@@ -823,7 +918,14 @@ def main():
         if user_id:
             print(f'  用户ID: {NewAPICheckin._mask_user_id(user_id)}')
 
-        client = NewAPICheckin(url, session_cookie, user_id, cf_clearance, login_username, login_password, access_token)
+        client = NewAPICheckin(url, session_cookie, user_id, cf_clearance, login_username, login_password,
+                               access_token, session_name, refresh_token)
+
+        # 轮换型 refresh token 被使用后，记录新值以便持久化
+        if client.new_refresh_token and client.new_refresh_token != refresh_token:
+            account['refresh_token'] = client.new_refresh_token
+            rotated_refresh_tokens[account['url']] = client.new_refresh_token
+            print('  [refresh] refresh token 已轮换，将写回状态存储')
 
         # 获取用户信息（可能触发自动登录）
         user_info = client.get_user_info()
@@ -995,6 +1097,20 @@ def main():
             with open(env_file, 'w', encoding='utf-8') as f:
                 f.write(new_content)
             print('[Session] .env 已更新')
+
+    # 把本次轮换出的 refresh token 写回 Gist（供下次运行使用）
+    if rotated_refresh_tokens:
+        try:
+            import state_store
+            if state_store.enabled():
+                print('\n[state] 检测到 %d 个轮换型 token，正在写回 Gist...'
+                      % len(rotated_refresh_tokens))
+                state_store.merge_and_save(rotated_refresh_tokens)
+            else:
+                print('\n[state] 有轮换型 token 但未配置 Gist，本次更新将在下次运行时失效')
+                print('        请设置 GH_GIST_TOKEN 与 GIST_ID')
+        except Exception as e:
+            print(f'[state] 写回失败: {e}')
 
     # 如果全部失败则返回错误码
     if fail_count == len(accounts):
