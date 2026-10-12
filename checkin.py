@@ -99,8 +99,19 @@ class NewAPICheckin:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         })
 
-        # 站点类型 B：先用 refresh token 换 access token（会轮换 refresh token）
-        if self.refresh_token:
+        # ---- 认证初始化 ----
+        # 优先级：
+        #   1) 配置了账号密码 → 主动独立登录。
+        #      登录会创建**独立会话**，不去碰浏览器持有的那个轮换型 refresh token，
+        #      因此云端定时任务与浏览器不会互相踢下线。
+        #   2) 只有 refresh token（站点类型 B）→ 用它换取 access token
+        #      （一次性轮换，新值必须持久化，见 state_store）。
+        #   3) 都没有 → 走类型 A 的 session cookie。
+        if self.login_username and self.login_password:
+            if not self._try_login() and self.refresh_token:
+                print('  [登录] 密码登录失败，回退到 refresh token')
+                self._refresh_access_token()
+        elif self.refresh_token:
             self._refresh_access_token()
 
         # new-api 支持系统访问令牌认证（Authorization 头），不依赖 session cookie
@@ -213,6 +224,33 @@ class NewAPICheckin:
                 return False
 
             if resp.status_code == 200 and data.get('success'):
+                # ---- 站点类型 B：登录成功后会下发轮换型 new_api_refresh ----
+                # 这条路径让 Actions 能用自己的账号密码换取**独立会话**，
+                # 从而不必与浏览器共享（并互相踢掉）同一个 refresh token。
+                import re as _re
+                new_refresh = None
+                for cookie in resp.cookies:
+                    if cookie.name == 'new_api_refresh' and cookie.value:
+                        new_refresh = cookie.value
+                        break
+                if not new_refresh:
+                    raw_sc = resp.headers.get('Set-Cookie', '') or ''
+                    m = _re.search(r'new_api_refresh=([^;,\s]+)', raw_sc)
+                    if m and m.group(1):
+                        new_refresh = m.group(1)
+
+                if new_refresh:
+                    self.refresh_token = new_refresh
+                    self.new_refresh_token = new_refresh  # 供 main() 持久化
+                    self.session.cookies.set(
+                        'new_api_refresh', new_refresh, path='/api/user/auth')
+                    print('  [登录] 登录成功，已拿到新的 refresh token')
+                    if self._refresh_access_token():
+                        return True
+                    print('  [登录] 但用新 refresh token 换取 access token 失败')
+                    return False
+
+                # ---- 站点类型 A：标准 session cookie ----
                 # 从响应 cookie 中获取新的 session_id
                 new_session = None
                 for cookie in resp.cookies:
@@ -228,8 +266,7 @@ class NewAPICheckin:
                 else:
                     # 可能 session cookie 在 set-cookie 头中
                     set_cookie = resp.headers.get('Set-Cookie', '')
-                    import re
-                    match = re.search(r'(?:session|session_id)=([^;]+)', set_cookie)
+                    match = _re.search(r'(?:session|session_id)=([^;]+)', set_cookie)
                     if match:
                         new_session = match.group(1)
                         self.session_cookie = new_session
@@ -650,7 +687,9 @@ def parse_accounts(accounts_str: str) -> list:
         data = json.loads(accounts_str)
         if isinstance(data, list):
             for item in data:
-                if isinstance(item, dict) and 'url' in item and ('session' in item or 'refresh_token' in item):
+                if isinstance(item, dict) and 'url' in item and (
+                        'session' in item or 'refresh_token' in item
+                        or 'login_username' in item):
                     account = {
                         'url': item['url'],
                         'session': item.get('session', '') or '',
