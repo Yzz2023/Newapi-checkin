@@ -887,10 +887,13 @@ def main():
         sys.exit(1)
 
     # 应用 Gist 里保存的轮换凭据（站点类型 B 的 refresh token 每次使用都会变）
+    state_store = None
     try:
-        import state_store
+        import state_store as _state_store
+        state_store = _state_store
         state_store.apply_to_accounts(accounts)
     except Exception as e:
+        state_store = None
         print(f'[state] 状态模块不可用: {e}')
 
     print(f'共 {len(accounts)} 个账号待签到\n')
@@ -926,6 +929,14 @@ def main():
             account['refresh_token'] = client.new_refresh_token
             rotated_refresh_tokens[account['url']] = client.new_refresh_token
             print('  [refresh] refresh token 已轮换，将写回状态存储')
+            # 立即回写：服务端此刻已作废旧 token，若等到全部跑完再保存，
+            # 中途被中断/超时就会永久丢失新 token（等于把该站登录态烧掉）。
+            if state_store is not None:
+                try:
+                    if state_store.merge_and_save({account['url']: client.new_refresh_token}):
+                        print('  [state] 已立即写回新 token')
+                except Exception as e:
+                    print(f'  [state] 立即写回失败（将在结尾重试）: {e}')
 
         # 获取用户信息（可能触发自动登录）
         user_info = client.get_user_info()
