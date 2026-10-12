@@ -85,6 +85,25 @@ class NewAPICheckin:
         self.refresh_token = refresh_token
         self.new_refresh_token = None
         self.session = requests.Session()
+        # 对瞬时网络故障自动重试（云端出网抖动、站点偶发 502/504、限流 429）。
+        # 签到接口是幂等的（重复签到返回「今日已签到」），因此允许重试 POST。
+        try:
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
+            _retry = Retry(
+                total=3, connect=3, read=3,
+                backoff_factor=1.5,
+                status_forcelist=(429, 500, 502, 503, 504),
+                allowed_methods=None,   # None = 含 POST
+                raise_on_status=False,
+            )
+            _adapter = HTTPAdapter(max_retries=_retry,
+                                   pool_connections=10, pool_maxsize=10)
+            self.session.mount('https://', _adapter)
+            self.session.mount('http://', _adapter)
+        except Exception as _e:
+            print(f'  [警告] 重试适配器安装失败（不影响主流程）: {_e}')
+
         if session_cookie:
             self.session.cookies.set(self.session_name, session_cookie)
 

@@ -1,14 +1,17 @@
 name: Keepalive Workflow
 
-# 防止 GitHub Actions 在 60 天不活动后自动禁用工作流
-# 每 50 天运行一次，保持工作流活跃
+# GitHub 的规则：**公开仓库连续 60 天无活动（commit/push）会禁用所有定时工作流**。
+# 仅"运行"定时任务并不一定算作活动，因此这里必须产生一次**真实的提交**才算数。
+# 每 20 天提交一次时间戳，留足余量。
 
 on:
   schedule:
-    # 每 50 天运行一次 (每月 1 日和 21 日 UTC 1:00)
-    - cron: '0 1 1,21 * *'
-  # 手动触发
+    # 每月 1、11、21 日 UTC 1:00（北京时间 9:00）
+    - cron: '0 1 1,11,21 * *'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   keepalive:
@@ -18,7 +21,19 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 保持工作流活跃
+      - name: 提交时间戳以刷新仓库活跃度
         run: |
-          echo "Keepalive ping at $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          echo "This workflow prevents GitHub from automatically disabling scheduled workflows."
+          set -e
+          mkdir -p .github
+          STAMP="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "$STAMP" > .github/keepalive.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/keepalive.txt
+          if git diff --staged --quiet; then
+            echo "无变化，跳过提交"
+          else
+            git commit -m "chore: keepalive $STAMP [skip ci]"
+            git push
+            echo "已提交: $STAMP"
+          fi
