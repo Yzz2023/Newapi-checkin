@@ -5,6 +5,7 @@ NewAPI 自动签到脚本
 支持多账号签到，通过 GitHub Actions 定时执行
 """
 
+import base64
 import os
 import sys
 import json
@@ -144,6 +145,100 @@ class NewAPICheckin:
         self.user_id = user_id
         if user_id:
             self.session.headers.update({'new-api-user': str(user_id)})
+        elif session_cookie and self.session_name in ('session', 'session_id'):
+            # ---- 类型 A 的 user_id 自举 ----
+            # 类型 A 站点把 session 存在 gin securecookie 里，**同时要求**
+            # `new-api-user: <uid>` 头；只给 session cookie 会直接 401。
+            # 而这个 uid 就编码在 session cookie 的载荷里，可以在本地解出来，
+            # 不需要先成功请求一次 /api/user/self（那会形成死锁：
+            # 没 uid -> 401 -> 拿不到 uid）。
+            uid = self._extract_user_id_from_session(session_cookie)
+            if uid:
+                self.user_id = uid
+                self.session.headers.update({'new-api-user': str(uid)})
+                print(f'  [初始化] 已从 session 解出 user_id={uid}，自动补齐 new-api-user 头')
+            else:
+                print('  [初始化] 未能从 session 解出 user_id，'
+                      '若该站要求 new-api-user 头可能返回 401')
+
+    @staticmethod
+    def _extract_user_id_from_session(session_cookie: str):
+        """
+        从 gin securecookie 中解出 user_id。
+
+        原理（gin-contrib/sessions 的 securecookie + gob 编码）：
+            outer = base64url_decode(session_cookie)   -> "<ts>|<hashkey>|<payload>"
+            gob   = base64url_decode(payload)
+            gob 中每个字段形如：<名长><名><类型名长><类型名><typeid><L>00<L-1字节值>
+            有符号整数走 zigzag：编码值 = id * 2
+
+        因此定位 b"\\x02id\\x03int" 后读长度与值，再 /2 即可。
+
+        这份实现是自包含的（不依赖 tools/ 目录），保证 Actions 环境也能用。
+        返回 int 或 None。
+        """
+        if not session_cookie:
+            return None
+
+        def _b64d(s):
+            s = s.strip()
+            pad = '=' * (-len(s) % 4)
+            for dec in (base64.urlsafe_b64decode, base64.b64decode):
+                try:
+                    return dec(s + pad)
+                except Exception:
+                    pass
+            return None
+
+        def _gob_uint(raw):
+            if not raw:
+                return None
+            b0 = raw[0]
+            if b0 <= 127:
+                return b0
+            n = 256 - b0
+            if n < 1 or 1 + n > len(raw):
+                return None
+            return int.from_bytes(raw[1:1 + n], 'big')
+
+        try:
+            outer = _b64d(session_cookie)
+            if not outer:
+                return None
+            parts = outer.decode('latin-1').split('|')
+            if len(parts) < 2:
+                return None
+            gob = _b64d(parts[1])
+            if not gob:
+                return None
+
+            needle = b'\x02id\x03int'
+            out = []
+            start = 0
+            while True:
+                p = gob.find(needle, start)
+                if p < 0:
+                    break
+                start = p + 1
+                i = p + len(needle)
+                if i + 3 > len(gob):
+                    continue
+                L = gob[i + 1]
+                if L < 2 or gob[i + 2] != 0:
+                    continue
+                raw = gob[i + 3:i + 2 + L]
+                if len(raw) != L - 1:
+                    continue
+                val = _gob_uint(raw)
+                if val and val % 2 == 0:
+                    out.append(val // 2)
+
+            for v in out:
+                if 1 <= v <= 10 ** 9:
+                    return v
+            return None
+        except Exception:
+            return None
 
     def _refresh_access_token(self) -> bool:
         """
