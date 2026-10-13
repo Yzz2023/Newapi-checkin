@@ -135,19 +135,28 @@ def browser_login(base_url: str, username: str, password: str, sitekey: str = No
                 browser.close()
                 return None
 
-            # 等 SPA 把登录表单渲染出来（慢站点给足时间）
+            # 等 SPA 把登录表单渲染出来（慢站点给足时间）。
+            # 找不到也不退出：只要同源文档已建立，就足以解 Turnstile 并提交登录，
+            # 不依赖前端框架是否挂载成功（cpolar 隧道类站点前端 bundle 拉不下来）。
             try:
-                page.wait_for_selector('input[type="password"]', timeout=45000)
+                page.wait_for_selector('input[type="password"]', timeout=25000)
+                time.sleep(2)
             except Exception:
-                print('  [浏览器登录] 未找到登录表单（页面结构可能不同或加载过慢）')
                 if verbose:
+                    print('  [浏览器登录] 未找到登录表单，改用直连模式'
+                          '（不依赖前端框架，仅借同源文档解 Turnstile 后提交）')
                     try:
                         print('    当前 URL:', page.url)
                     except Exception:
                         pass
-                browser.close()
-                return None
-            time.sleep(2)
+                # 确保同源文档上下文已就绪（RENDER_JS 需要 document.body）
+                try:
+                    page.wait_for_function('() => !!(document && document.body)',
+                                           timeout=30000)
+                except Exception:
+                    print('  [浏览器登录] 同源文档上下文未就绪')
+                    browser.close()
+                    return None
 
             # 在站点页面内注入 Turnstile 组件并求解（origin 正确才能过域名校验）
             try:
