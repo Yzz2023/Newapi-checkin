@@ -72,7 +72,8 @@ class NewAPICheckin:
 
     def __init__(self, base_url: str, session_cookie: str, user_id: str = None, cf_clearance: str = None,
                  login_username: str = None, login_password: str = None, access_token: str = None,
-                 session_name: str = 'session', refresh_token: str = None):
+                 session_name: str = 'session', refresh_token: str = None,
+                 browser_fallback_on_credential_error: bool = False):
         self.base_url = base_url.rstrip('/')
         self.session_cookie = session_cookie
         self.session_name = session_name or 'session'
@@ -84,6 +85,9 @@ class NewAPICheckin:
         # 轮换型 refresh token（站点类型 B）：使用时会被服务端轮换
         self.refresh_token = refresh_token
         self.new_refresh_token = None
+        # 凭据错误时是否再用浏览器复核一次（默认关闭：多数站点不校验 Turnstile，
+        # 开启会让每次失败多花 30-90 秒）。诊断/排查时可置 True。
+        self.browser_fallback_on_credential_error = browser_fallback_on_credential_error
         self.session = requests.Session()
         # 对瞬时网络故障自动重试（云端出网抖动、站点偶发 502/504、限流 429）。
         # 签到接口是幂等的（重复签到返回「今日已签到」），因此允许重试 POST。
@@ -209,6 +213,31 @@ class NewAPICheckin:
               f'{"，并捕获到轮换后的新 token" if self.new_refresh_token else ""}')
         return True
 
+    def _site_uses_turnstile(self) -> bool:
+        """
+        探测站点是否启用了 Turnstile（读 /api/status 的 turnstile_site_key）。
+
+        结果缓存在实例上，整个生命周期只探测一次。
+        失败时返回 False（不影响主流程），避免在无网络/接口变更时误触发浏览器登录。
+        """
+        cached = getattr(self, '_turnstile_probe', None)
+        if cached is not None:
+            return cached
+        result = False
+        try:
+            resp = self.session.get(f'{self.base_url}/api/status', timeout=15)
+            if resp.status_code == 200:
+                data = resp.json() or {}
+                payload = data.get('data') or {}
+                if payload.get('turnstile_site_key'):
+                    result = True
+                elif payload.get('turnstile_check') is True:
+                    result = True
+        except Exception:
+            result = False
+        self._turnstile_probe = result
+        return result
+
     def _login_via_browser(self) -> bool:
         """
         站点开启 Turnstile 时的登录回退：用真实 Chrome 在站点登录页完成登录。
@@ -285,12 +314,39 @@ class NewAPICheckin:
 
             # ---- 站点开启 Turnstile：改用真实浏览器在登录页完成登录 ----
             # 服务端把 token 读作**查询参数**，且 sitekey 绑定域名，只能在站点页面内解。
-            if (resp.status_code == 200 and not data.get('success')
-                    and 'turnstile' in str(data.get('message') or '').lower()):
+            #
+            # 判定分两级：
+            #   a) 服务端**明确抱怨**人机验证（如「Turnstile token 为空」）
+            #      → 强信号，直接走浏览器登录
+            #   b) 服务端只报「凭据错误」，但站点确实配置了 Turnstile
+            #      → 弱信号。实测多数这类站点（如 api456.me / xingya.site）登录
+            #        并不强制校验 Turnstile，走浏览器只会白白拖慢 30-90 秒；
+            #        但确有个别实现会先校验人机再校验凭据，所以这里只做
+            #        **一次** 防御性尝试，且仅在 `allow_browser_fallback` 为真时。
+            _raw_msg = str(data.get('message') or '')
+            _msg_lower = _raw_msg.lower()
+            _looks_turnstile = (
+                'turnstile' in _msg_lower
+                or 'captcha' in _msg_lower
+                or '人机' in _raw_msg
+                or '安全验证' in _raw_msg
+            )
+            if not data.get('success') and _looks_turnstile:
+                print(f'  [登录] 服务端提示需要人机验证: {_raw_msg[:60]}')
                 if self._login_via_browser():
                     return True
                 print('  [登录] 浏览器登录未成功')
                 return False
+
+            # 弱信号兜底：凭据错误 + 站点启用了 Turnstile + 允许兜底
+            if (not data.get('success') and self.browser_fallback_on_credential_error
+                    and self._site_uses_turnstile()
+                    and not getattr(self, '_browser_fallback_tried', False)):
+                self._browser_fallback_tried = True
+                print('  [登录] 站点启用了 Turnstile，尝试用浏览器复核一次登录...')
+                if self._login_via_browser():
+                    return True
+                print('  [登录] 浏览器复核未通过，判定为凭据问题')
 
             if resp.status_code == 200 and data.get('success'):
                 # ---- 站点类型 B：登录成功后会下发轮换型 new_api_refresh ----
