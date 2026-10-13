@@ -74,10 +74,14 @@ class NewAPICheckin:
     def __init__(self, base_url: str, session_cookie: str, user_id: str = None, cf_clearance: str = None,
                  login_username: str = None, login_password: str = None, access_token: str = None,
                  session_name: str = 'session', refresh_token: str = None,
-                 browser_fallback_on_credential_error: bool = False):
+                 browser_fallback_on_credential_error: bool = False,
+                 checkin_path: str = None, checkin_method: str = 'POST'):
         self.base_url = base_url.rstrip('/')
         self.session_cookie = session_cookie
         self.session_name = session_name or 'session'
+        # 站点若把签到接口改名，可在配置里显式指定（否则自动探测）
+        self.checkin_path = checkin_path or None
+        self.checkin_method = (checkin_method or 'POST').upper()
         self.original_cf_clearance = cf_clearance
         self.cf_bypassed = False
         self.login_username = login_username
@@ -123,25 +127,9 @@ class NewAPICheckin:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         })
 
-        # ---- 认证初始化 ----
-        # 优先级：
-        #   1) 配置了账号密码 → 主动独立登录。
-        #      登录会创建**独立会话**，不去碰浏览器持有的那个轮换型 refresh token，
-        #      因此云端定时任务与浏览器不会互相踢下线。
-        #   2) 只有 refresh token（站点类型 B）→ 用它换取 access token
-        #      （一次性轮换，新值必须持久化，见 state_store）。
-        #   3) 都没有 → 走类型 A 的 session cookie。
-        if self.login_username and self.login_password:
-            if not self._try_login() and self.refresh_token:
-                print('  [登录] 密码登录失败，回退到 refresh token')
-                self._refresh_access_token()
-        elif self.refresh_token:
-            self._refresh_access_token()
-
-        # new-api 支持系统访问令牌认证（Authorization 头），不依赖 session cookie
-        if self.access_token:
-            self.session.headers.update({'Authorization': self.access_token})
-
+        # ---- user_id / new-api-user 头（必须在认证初始化之前就绪）----
+        # ⚠️ 顺序很重要：_refresh_access_token() 内部会读 self.user_id，
+        #    所以这个属性必须在任何可能触发刷新的调用之前完成赋值。
         self.user_id = user_id
         if user_id:
             self.session.headers.update({'new-api-user': str(user_id)})
@@ -160,6 +148,25 @@ class NewAPICheckin:
             else:
                 print('  [初始化] 未能从 session 解出 user_id，'
                       '若该站要求 new-api-user 头可能返回 401')
+
+        # ---- 认证初始化 ----
+        # 优先级：
+        #   1) 配置了账号密码 → 主动独立登录。
+        #      登录会创建**独立会话**，不去碰浏览器持有的那个轮换型 refresh token，
+        #      因此云端定时任务与浏览器不会互相踢下线。
+        #   2) 只有 refresh token（站点类型 B）→ 用它换取 access token
+        #      （一次性轮换，新值必须持久化，见 state_store）。
+        #   3) 都没有 → 走类型 A 的 session cookie。
+        if self.login_username and self.login_password:
+            if not self._try_login() and self.refresh_token:
+                print('  [登录] 密码登录失败，回退到 refresh token')
+                self._refresh_access_token()
+        elif self.refresh_token:
+            self._refresh_access_token()
+
+        # new-api 支持系统访问令牌认证（Authorization 头），不依赖 session cookie
+        if self.access_token:
+            self.session.headers.update({'Authorization': self.access_token})
 
     @staticmethod
     def _extract_user_id_from_session(session_cookie: str):
@@ -374,6 +381,40 @@ class NewAPICheckin:
         print('  [登录] 浏览器登录返回的 cookie 里没有可用凭据')
         return False
 
+    def _adopt_session_login(self, data: dict, new_session: str,
+                             session_name: str = 'session') -> None:
+        """
+        登录成功后统一收尾（站点类型 A）。
+
+        关键点：new-api 的类型 A 站点**同时要求** `new-api-user: <uid>` 头，
+        只设 session cookie 会让后续所有请求 401（实测服务端会明确返回
+        「无权进行此操作，未提供 New-Api-User」）。
+        而 uid 有两个可靠来源，按优先级取：
+          1) 登录响应体里的 data.id（最直接，实测 api456.me 会返回）
+          2) 从新下发的 session cookie 里解码（gin securecookie + gob）
+
+        历史上这里只设了 cookie、没设 uid，导致「密码登录明明成功、
+        后续请求却全部 401」的假失败。
+        """
+        if new_session:
+            self.session_cookie = new_session
+            self.session.cookies.set(session_name or 'session', new_session)
+
+        uid = None
+        payload = data.get('data') if isinstance(data, dict) else None
+        if isinstance(payload, dict) and payload.get('id'):
+            uid = payload['id']
+        if not uid and new_session:
+            uid = self._extract_user_id_from_session(new_session)
+
+        if uid:
+            self.user_id = uid
+            self.session.headers.update({'new-api-user': str(uid)})
+            print(f'  [登录] 已补齐 new-api-user={uid}')
+        else:
+            print('  [登录] 警告：未能确定 user_id，'
+                  '若该站要求 new-api-user 头，后续请求可能 401')
+
     def _try_login(self) -> bool:
         """
         尝试使用配置的账号密码重新登录，获取新的 session
@@ -473,29 +514,28 @@ class NewAPICheckin:
                 # ---- 站点类型 A：标准 session cookie ----
                 # 从响应 cookie 中获取新的 session_id
                 new_session = None
+                new_session_name = 'session'
                 for cookie in resp.cookies:
-                    if cookie.name == 'session' or cookie.name == 'session_id':
+                    if cookie.name in ('session', 'session_id') and cookie.value:
                         new_session = cookie.value
+                        new_session_name = cookie.name
                         break
 
-                if new_session:
-                    self.session_cookie = new_session
-                    self.session.cookies.set('session', new_session)
-                    print(f'  [登录] 登录成功，已更新 session')
-                    return True
-                else:
+                if not new_session:
                     # 可能 session cookie 在 set-cookie 头中
                     set_cookie = resp.headers.get('Set-Cookie', '')
-                    match = _re.search(r'(?:session|session_id)=([^;]+)', set_cookie)
+                    match = _re.search(r'(session_id|session)=([^;]+)', set_cookie)
                     if match:
-                        new_session = match.group(1)
-                        self.session_cookie = new_session
-                        self.session.cookies.set('session', new_session)
-                        print(f'  [登录] 登录成功，已更新 session')
-                        return True
+                        new_session_name = match.group(1)
+                        new_session = match.group(2)
 
-                    print(f'  [登录] 登录成功但未获取到新的 session cookie')
-                    return False
+                if new_session:
+                    self._adopt_session_login(data, new_session, new_session_name)
+                    print('  [登录] 登录成功，已更新 session')
+                    return True
+
+                print('  [登录] 登录成功但未获取到新的 session cookie')
+                return False
             else:
                 msg = data.get('message', '未知错误')
                 print(f'  [登录] 登录失败: {msg}')
@@ -604,6 +644,141 @@ class NewAPICheckin:
                 traceback.print_exc()
             return None
 
+    # ---- 签到接口候选（应对定制版 fork 改名 / 迁移）----
+    # 实测 xingya.site 把标准接口停用了：
+    #   POST /api/user/checkin            -> 410 {"code":"checkin_endpoint_retired"}
+    #   POST /api/user/xingya-daily-claim -> 200 ✅ 真正的签到接口
+    # 因此这里按顺序尝试，遇到「接口不存在 / 已停止」就换下一个；
+    # 全部失败时再从站点前端 JS 里自动发现（见 _discover_checkin_endpoints）。
+    CHECKIN_CANDIDATES = [
+        ('/api/user/checkin', 'POST'),            # new-api 标准
+        ('/api/user/daily-checkin', 'POST'),
+        ('/api/user/checkin/daily', 'POST'),
+        ('/api/user/daily_claim', 'POST'),
+        ('/api/user/daily-claim', 'POST'),
+        ('/api/user/sign-in', 'POST'),
+    ]
+
+    # 这些路径看着像签到，其实是「查询状态」或无关接口，排除掉
+    _ENDPOINT_EXCLUDE = ('key', 'reviews', 'settings', 'check-name', 'info',
+                         'status', 'config', 'records', 'history', 'list')
+
+    @staticmethod
+    def _endpoint_invalid(resp, data) -> bool:
+        """判断响应是否表示「这个接口不存在 / 已停用」（而不是业务失败）。"""
+        if resp is not None and resp.status_code in (404, 405, 410):
+            return True
+        d = data if isinstance(data, dict) else {}
+        code = str(d.get('code') or '').lower()
+        msg = str(d.get('message') or '')
+        if 'retired' in code or 'endpoint' in code or 'not_found' in code:
+            return True
+        for kw in ('已停止', '已停用', '接口不存在', 'Invalid URL', 'not found',
+                   'no such', 'unsupported'):
+            if kw.lower() in msg.lower():
+                return True
+        return False
+
+    def _discover_checkin_endpoints(self) -> list:
+        """
+        从站点前端 JS 里发现签到接口。
+
+        定制版站点会把接口改名（如 xingya.site 的 /api/user/xingya-daily-claim），
+        但前端总得调用它，所以路径一定出现在打包后的 JS 里。
+        按「更像动作接口」的优先级排序返回。
+        """
+        import re as _re
+        found = []
+        try:
+            r = self.session.get(f'{self.base_url}/login', timeout=20)
+            if r.status_code != 200:
+                return []
+            srcs = _re.findall(r'src="([^"]+\.js)"', r.text)
+        except Exception:
+            return []
+
+        for u in srcs[:8]:
+            full = u if u.startswith('http') else \
+                self.base_url + (u if u.startswith('/') else '/' + u)
+            try:
+                js = self.session.get(full, timeout=35).text
+            except Exception:
+                continue
+            for m in _re.finditer(
+                    r'["\'`](/api/[A-Za-z0-9_/\-]*(?:check|claim|sign)[A-Za-z0-9_/\-]*)["\'`]',
+                    js):
+                p = m.group(1)
+                if p in found:
+                    continue
+                if any(x in p.lower() for x in self._ENDPOINT_EXCLUDE):
+                    continue
+                if p in ('/api/user/auth/refresh',):
+                    continue
+                found.append(p)
+
+        # 动作型接口优先：claim > signin > checkin
+        def score(p):
+            low = p.lower()
+            if 'claim' in low:
+                return 0
+            if 'sign' in low:
+                return 1
+            return 2
+        found.sort(key=score)
+        return found
+
+    def _checkin_candidates(self) -> list:
+        """返回本次要依次尝试的 (path, method) 列表。"""
+        cands = []
+        if getattr(self, 'checkin_path', None):
+            cands.append((self.checkin_path, getattr(self, 'checkin_method', 'POST')))
+        for c in self.CHECKIN_CANDIDATES:
+            if c not in cands:
+                cands.append(c)
+        return cands
+
+    def _post_checkin_first_ok(self):
+        """
+        依次尝试候选接口，返回 (resp, path)。
+        全部不可用时返回 (None, None)。
+        """
+        for path, method in self._checkin_candidates():
+            try:
+                resp = self.session.request(method, f'{self.base_url}{path}', timeout=30)
+            except Exception as e:
+                print(f'  [签到] {path} 请求异常: {str(e)[:60]}')
+                continue
+            try:
+                data = resp.json()
+            except Exception:
+                data = None
+            if self._endpoint_invalid(resp, data):
+                extra = ''
+                if isinstance(data, dict) and data.get('message'):
+                    extra = f' - {str(data["message"])[:44]}'
+                print(f'  [签到] 接口 {path} 不可用（HTTP {resp.status_code}{extra}）')
+                continue
+            return resp, path
+
+        # 标准候选全军覆没 → 从前端 JS 里发现
+        discovered = self._discover_checkin_endpoints()
+        if discovered:
+            print(f'  [签到] 从站点前端发现候选接口: {discovered}')
+        for path in discovered:
+            try:
+                resp = self.session.post(f'{self.base_url}{path}', timeout=30)
+            except Exception:
+                continue
+            try:
+                data = resp.json()
+            except Exception:
+                data = None
+            if self._endpoint_invalid(resp, data):
+                continue
+            print(f'  [签到] 采用发现的接口: {path}')
+            return resp, path
+        return None, None
+
     def checkin(self) -> dict:
         """
         执行签到
@@ -624,14 +799,20 @@ class NewAPICheckin:
         }
 
         try:
-            resp = self.session.post(f'{self.base_url}/api/user/checkin', timeout=30)
+            resp, used_path = self._post_checkin_first_ok()
+            if resp is None:
+                result['message'] = '所有候选签到接口均不可用（站点可能再次改版）'
+                return result
+            if used_path != '/api/user/checkin':
+                print(f'  [签到] 使用接口: {used_path}')
 
             if resp.status_code == 401:
                 result['message'] = '认证失败: Session 可能已过期，请重新获取'
                 # 尝试自动登录
                 if self._try_login():
                     print(f'  [登录] 重试签到...')
-                    resp = self.session.post(f'{self.base_url}/api/user/checkin', timeout=30)
+                    resp = self.session.request('POST',
+                                                f'{self.base_url}{used_path}', timeout=30)
                     if resp.status_code == 200:
                         try:
                             data = resp.json()
@@ -937,6 +1118,11 @@ def parse_accounts(accounts_str: str) -> list:
                     # 如果提供了系统访问令牌，添加到账号信息中
                     if 'access_token' in item:
                         account['access_token'] = item['access_token']
+                    # 站点自定义签到接口（定制版 fork 会改名）
+                    if item.get('checkin_path'):
+                        account['checkin_path'] = item['checkin_path']
+                    if item.get('checkin_method'):
+                        account['checkin_method'] = item['checkin_method']
                     accounts.append(account)
             return accounts
     except json.JSONDecodeError:
@@ -1181,7 +1367,9 @@ def main():
             print(f'  用户ID: {NewAPICheckin._mask_user_id(user_id)}')
 
         client = NewAPICheckin(url, session_cookie, user_id, cf_clearance, login_username, login_password,
-                               access_token, session_name, refresh_token)
+                               access_token, session_name, refresh_token,
+                               checkin_path=account.get('checkin_path'),
+                               checkin_method=account.get('checkin_method') or 'POST')
 
         # 自举后的 uid 可能比配置里更准（类型 A 从 session 解出来），回填到日志与配置
         if client.user_id and client.user_id != user_id:
