@@ -1183,6 +1183,12 @@ def main():
         client = NewAPICheckin(url, session_cookie, user_id, cf_clearance, login_username, login_password,
                                access_token, session_name, refresh_token)
 
+        # 自举后的 uid 可能比配置里更准（类型 A 从 session 解出来），回填到日志与配置
+        if client.user_id and client.user_id != user_id:
+            user_id = client.user_id
+            account['user_id'] = user_id
+            print(f'  用户ID: {NewAPICheckin._mask_user_id(user_id)}（自举）')
+
         # 轮换型 refresh token 被使用后，记录新值以便持久化
         if client.new_refresh_token and client.new_refresh_token != refresh_token:
             account['refresh_token'] = client.new_refresh_token
